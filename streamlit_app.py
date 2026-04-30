@@ -271,14 +271,23 @@ with st.spinner("Loading and pairing rows..."):
         st.error(f"Failed to load: {e}")
         st.stop()
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Valid Pairs", f"{len(pairs):,}")
-c2.metric("Wins", f"{(pairs['result']=='W').sum():,}")
-c3.metric("Losses", f"{(pairs['result']=='L').sum():,}")
-c4.metric("Stat Features", f"{len(stat_names)}")
-
-st.caption(f"Date range: {pairs['date'].min().date()} → {pairs['date'].max().date()}. "
-           "A 'pair' = a previous game's stats matched to the team's next home game outcome (B[prev]=H[current]).")
+_wins = int((pairs['result']=='W').sum())
+_losses = int((pairs['result']=='L').sum())
+st.markdown(
+    f"""
+    <div style="font-size: 0.78em; opacity: 0.85; margin-top: -8px; margin-bottom: 4px;">
+      <span style="margin-right: 22px;"><b>Valid Pairs:</b> {len(pairs):,}</span>
+      <span style="margin-right: 22px;"><b>Wins:</b> {_wins:,}</span>
+      <span style="margin-right: 22px;"><b>Losses:</b> {_losses:,}</span>
+      <span><b>Stat Features:</b> {len(stat_names)}</span>
+    </div>
+    <div style="font-size: 0.72em; opacity: 0.6; margin-bottom: 10px;">
+      Date range: {pairs['date'].min().date()} → {pairs['date'].max().date()}.
+      A 'pair' = a previous game's stats matched to the team's next home game outcome (B[prev]=H[current]).
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🎯 Test One Pattern",
@@ -288,9 +297,97 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "⭐ Saved Favorites",
 ])
 
-# Initialize favorites in session state
+# ============================================================
+# FAVORITES PERSISTENCE
+# ============================================================
+import json, os
+FAVORITES_FILE = "favorites.json"
+
+def _serialize_fav(fav):
+    """Convert a favorite dict (with pandas objects) to a JSON-safe dict.
+    We persist only the SUMMARY metadata. The full game-list is reconstructible
+    from the equation + the same CSV.
+    """
+    return {
+        'name': fav.get('name', ''),
+        'eq': fav.get('eq', ''),
+        'saved_at': fav.get('saved_at', ''),
+        'stats': {k: (None if (v is None or (isinstance(v, float) and pd.isna(v))) else v)
+                   for k, v in fav.get('stats', {}).items()},
+        # Optional: structured pattern so we can rebuild on demand
+        'structured': fav.get('structured', None),
+    }
+
+
+def save_favorites_to_disk():
+    """Write the current favorites to a JSON file. Silently ignores errors."""
+    try:
+        data = [_serialize_fav(f) for f in st.session_state.get('favorites', [])]
+        with open(FAVORITES_FILE, 'w') as fh:
+            json.dump(data, fh, indent=2, default=str)
+    except Exception:
+        pass  # not fatal — session-only persistence still works
+
+
+def load_favorites_from_disk():
+    """Load favorites JSON if it exists. Returns a list of fav dicts."""
+    if not os.path.exists(FAVORITES_FILE):
+        return []
+    try:
+        with open(FAVORITES_FILE, 'r') as fh:
+            data = json.load(fh)
+        # Normalize: each loaded fav may not have 'mask'/'games'/'monthly' yet —
+        # those will be reconstructed on first view if the same CSV is loaded.
+        return data
+    except Exception:
+        return []
+
+
+# Initialize favorites in session state — loading from disk on first run
 if 'favorites' not in st.session_state:
-    st.session_state['favorites'] = []
+    st.session_state['favorites'] = load_favorites_from_disk()
+
+
+def reconstruct_fav_mask(fav, pairs, stat_names):
+    """Given a saved favorite's 'structured' pattern, rebuild the boolean mask.
+    Returns None if pattern can't be rebuilt (e.g., ML model patterns)."""
+    s = fav.get('structured')
+    if not s:
+        return None
+    ptype = s.get('type')
+    try:
+        if ptype == 'manual':
+            # {col_keys: [[col, mult], ...], operator, thresh OR [lo, hi]}
+            score = np.zeros(len(pairs))
+            for col, m in s['col_keys']:
+                if col not in pairs.columns:
+                    return None
+                score = score + pairs[col].fillna(0) * float(m)
+            op = s['operator']
+            t = s['thresh']
+            if op == ">":   mask = score > t
+            elif op == ">=": mask = score >= t
+            elif op == "<":  mask = score < t
+            elif op == "<=": mask = score <= t
+            elif op == "between":
+                lo, hi = t
+                mask = (score >= lo) & (score <= hi)
+            else:
+                return None
+            return pd.Series(mask, index=pairs.index).fillna(False)
+
+        elif ptype == 'threshold_combo':
+            # {combo: [[col, op, thresh], ...]}
+            mask = pd.Series(True, index=pairs.index)
+            for col, op, t in s['combo']:
+                if col not in pairs.columns:
+                    return None
+                v = pairs[col]
+                mask &= (v > t) if op == ">" else (v < t)
+            return mask.fillna(False)
+    except Exception:
+        return None
+    return None
 
 # ============================================================
 # TAB 1: Single pattern with multipliers
@@ -322,8 +419,14 @@ with tab1:
     run_clicked = btn_col1.button("Run backtest", type="primary", key="t1_run")
     clear_clicked = btn_col2.button("🗑️ Clear results", key="t1_clear")
 
+    # Build a "fingerprint" of the current inputs to detect changes
+    if operator == "between":
+        current_fingerprint = (n_cols, tuple(col_keys), operator, thresh_lo, thresh_hi)
+    else:
+        current_fingerprint = (n_cols, tuple(col_keys), operator, thresh)
+
     if clear_clicked:
-        for k in ['t1_stats', 't1_mask', 't1_eq', 't1_monthly']:
+        for k in ['t1_stats', 't1_mask', 't1_eq', 't1_monthly', 't1_fingerprint']:
             st.session_state.pop(k, None)
         st.rerun()
 
@@ -347,35 +450,50 @@ with tab1:
         op_str = operator if operator != "between" else f"between {thresh_lo} and {thresh_hi}"
         eq_str = " + ".join(eq_parts) + f" {op_str}" + (f" {thresh}" if operator != "between" else "")
 
-        # Persist
+        # Persist results AND the fingerprint of the inputs that produced them
         st.session_state['t1_stats'] = stats
         st.session_state['t1_mask'] = mask
         st.session_state['t1_eq'] = eq_str
         st.session_state['t1_monthly'] = monthly_breakdown(pairs, mask)
+        st.session_state['t1_fingerprint'] = current_fingerprint
+        st.session_state['t1_col_keys'] = list(col_keys)
+        st.session_state['t1_operator'] = operator
+        st.session_state['t1_thresh'] = (thresh_lo, thresh_hi) if operator == "between" else thresh
 
         # Also save for Tab 4
         st.session_state['last_mask'] = mask
         st.session_state['last_eq'] = eq_str
+        st.session_state['last_structured'] = {
+            'type': 'manual',
+            'col_keys': [[c, float(m)] for c, m in col_keys],
+            'operator': operator,
+            'thresh': [thresh_lo, thresh_hi] if operator == "between" else float(thresh),
+        }
 
-    # Display the persisted results (so they don't vanish on rerun)
+    # Display the persisted results — but ONLY if the inputs match what produced them
     if 't1_stats' in st.session_state:
-        stats = st.session_state['t1_stats']
+        stored_fp = st.session_state.get('t1_fingerprint')
+        if stored_fp != current_fingerprint:
+            st.warning("⚠️ Inputs have changed since the last run. "
+                       "Click **Run backtest** to update, or **Clear results** to dismiss.")
+        else:
+            stats = st.session_state['t1_stats']
 
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Occurrences", f"{stats['count']:,}")
-        m2.metric("Win Rate", f"{stats['win_rate']:.1%}" if pd.notna(stats['win_rate']) else "—")
-        m3.metric("Total $", f"${stats['total_profit']:,.2f}")
-        m4.metric("ROI", f"{stats['roi']:.1%}" if pd.notna(stats['roi']) else "—")
-        m5.metric("Lowest Pt", f"${stats['lowest']:,.2f}" if pd.notna(stats['lowest']) else "—")
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Occurrences", f"{stats['count']:,}")
+            m2.metric("Win Rate", f"{stats['win_rate']:.1%}" if pd.notna(stats['win_rate']) else "—")
+            m3.metric("Total $", f"${stats['total_profit']:,.2f}")
+            m4.metric("ROI", f"{stats['roi']:.1%}" if pd.notna(stats['roi']) else "—")
+            m5.metric("Lowest Pt", f"${stats['lowest']:,.2f}" if pd.notna(stats['lowest']) else "—")
 
-        st.code(st.session_state['t1_eq'], language="text")
+            st.code(st.session_state['t1_eq'], language="text")
 
-        # Monthly breakdown — formatted with $/% and bolded TOTAL row
-        st.markdown("**Monthly breakdown**")
-        monthly = st.session_state['t1_monthly']
-        st.dataframe(format_monthly_table(monthly), use_container_width=True, hide_index=True)
+            # Monthly breakdown — formatted with $/% and bolded TOTAL row
+            st.markdown("**Monthly breakdown**")
+            monthly = st.session_state['t1_monthly']
+            st.dataframe(format_monthly_table(monthly), use_container_width=True, hide_index=True)
 
-        st.info("👉 Switch to 'Inspect Games' to see the actual matched games.")
+            st.info("👉 Switch to 'Inspect Games' to see the actual matched games.")
 
 # ============================================================
 # TAB 2: Threshold brute-force
@@ -529,6 +647,10 @@ with tab2:
             mask = mask.fillna(False)
             st.session_state['last_mask'] = mask
             st.session_state['last_eq'] = lb.iloc[idx]['pattern']
+            st.session_state['last_structured'] = {
+                'type': 'threshold_combo',
+                'combo': [[col, op, float(t)] for col, op, t in combo],
+            }
             st.success("Loaded. Switch to Inspect Games tab.")
 
 # ============================================================
@@ -670,6 +792,7 @@ with tab3:
             # Save
             st.session_state['last_mask'] = test_mask_full
             st.session_state['last_eq'] = "ML model: " + eq[:100] + "..."
+            st.session_state['last_structured'] = None  # ML pattern can't be reconstructed
 
 # ============================================================
 # TAB 4: Inspect
@@ -704,6 +827,10 @@ with tab4:
             if save_clicked:
                 # Capture summary stats
                 stats = evaluate_mask(pairs, mask)
+
+                # Capture structured pattern (for re-loading later w/o needing the model)
+                structured = st.session_state.get('last_structured', None)
+
                 fav = {
                     'name': eq_label[:80],
                     'eq': eq_label,
@@ -712,8 +839,10 @@ with tab4:
                     'games': games[display_cols].copy(),
                     'monthly': monthly_breakdown(pairs, mask),
                     'saved_at': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M'),
+                    'structured': structured,
                 }
                 st.session_state['favorites'].append(fav)
+                save_favorites_to_disk()
                 st.success(f"⭐ Saved! ({len(st.session_state['favorites'])} total favorites)")
 
             # Formatted games table — date as mm/dd/yyyy, $ amounts
@@ -741,23 +870,73 @@ with tab5:
     st.subheader("⭐ Saved Favorites")
     favs = st.session_state.get('favorites', [])
 
+    # === Backup / Restore section ===
+    with st.expander("💾 Backup & Restore favorites", expanded=False):
+        st.caption(
+            "Favorites are auto-saved to a file on the server (`favorites.json`). "
+            "On Streamlit Cloud the server filesystem can be reset on redeploys, "
+            "so for true cross-session safety, periodically download a JSON backup below "
+            "and re-upload it any time to restore."
+        )
+        bk1, bk2 = st.columns(2)
+        with bk1:
+            if favs:
+                backup_data = json.dumps([_serialize_fav(f) for f in favs], indent=2, default=str)
+                st.download_button(
+                    "📥 Download favorites JSON (backup)",
+                    backup_data,
+                    "favorites_backup.json",
+                    "application/json",
+                )
+            else:
+                st.caption("Nothing to back up yet.")
+        with bk2:
+            uploaded_favs = st.file_uploader("📤 Restore from JSON backup", type=['json'], key="t5_restore")
+            if uploaded_favs is not None:
+                try:
+                    imported = json.loads(uploaded_favs.getvalue())
+                    if isinstance(imported, list):
+                        # Replace mode (you could also do append — keeping it explicit)
+                        st.session_state['favorites'] = imported
+                        save_favorites_to_disk()
+                        st.success(f"✅ Restored {len(imported)} favorites. Refresh-proof.")
+                        st.rerun()
+                    else:
+                        st.error("Invalid backup format — expected a JSON list.")
+                except Exception as e:
+                    st.error(f"Failed to load backup: {e}")
+
+    favs = st.session_state.get('favorites', [])  # refresh after possible restore
+
     if not favs:
         st.info("No favorites saved yet. From the **Inspect Games** tab, click "
                 "**⭐ Save to Favorites** on any pattern to keep it here.")
     else:
         st.caption(f"{len(favs)} saved pattern{'s' if len(favs) != 1 else ''}. "
-                   "Favorites persist for the current browser session only — "
-                   "use the export button below to keep a permanent copy.")
+                   "Auto-saved to disk; use the backup section above for cross-deploy safety.")
 
         # Quick summary list of all favorites
+        def _safe_pct(v):
+            try: return f"{float(v):.1%}" if v is not None and not (isinstance(v, float) and pd.isna(v)) else "—"
+            except: return "—"
+
+        def _safe_money(v):
+            try:
+                v = float(v)
+                if pd.isna(v): return "—"
+                return f"-${abs(v):,.2f}" if v < 0 else f"${v:,.2f}"
+            except: return "—"
+
         summary = pd.DataFrame([{
             '#': i,
-            'Saved At': f['saved_at'],
-            'Pattern': f['eq'][:80] + ('...' if len(f['eq']) > 80 else ''),
-            'Occurrences': f['stats']['count'],
-            'Win Rate': f"{f['stats']['win_rate']:.1%}" if pd.notna(f['stats']['win_rate']) else "—",
-            'Total $': f"${f['stats']['total_profit']:,.2f}",
-            'ROI': f"{f['stats']['roi']:.1%}" if pd.notna(f['stats']['roi']) else "—",
+            'Saved At': f.get('saved_at', ''),
+            'Pattern': (f.get('eq', '') or '')[:80] + ('...' if len(f.get('eq', '') or '') > 80 else ''),
+            'Occurrences': f.get('stats', {}).get('count', '—'),
+            'Wins': f.get('stats', {}).get('wins', '—'),
+            'Losses': f.get('stats', {}).get('losses', '—'),
+            'Win Rate': _safe_pct(f.get('stats', {}).get('win_rate')),
+            'Total $': _safe_money(f.get('stats', {}).get('total_profit')),
+            'ROI': _safe_pct(f.get('stats', {}).get('roi')),
         } for i, f in enumerate(favs)])
         st.dataframe(summary, use_container_width=True, hide_index=True)
 
@@ -768,54 +947,89 @@ with tab5:
         chosen = favs[idx]
 
         c1, c2 = st.columns([3, 1])
-        c1.markdown(f"### {chosen['eq'][:120]}")
-        c1.caption(f"Saved at {chosen['saved_at']}")
+        c1.markdown(f"### {(chosen.get('eq','') or '(no description)')[:120]}")
+        c1.caption(f"Saved at {chosen.get('saved_at','')}")
 
         if c2.button("🗑️ Delete this favorite", key="t5_del"):
             del st.session_state['favorites'][idx]
+            save_favorites_to_disk()
             st.rerun()
 
         # Stats metric strip
-        s = chosen['stats']
+        s = chosen.get('stats', {}) or {}
         m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Occurrences", f"{s['count']:,}")
-        m2.metric("Win Rate", f"{s['win_rate']:.1%}" if pd.notna(s['win_rate']) else "—")
-        m3.metric("Total $", f"${s['total_profit']:,.2f}")
-        m4.metric("ROI", f"{s['roi']:.1%}" if pd.notna(s['roi']) else "—")
-        m5.metric("Lowest Pt", f"${s['lowest']:,.2f}" if pd.notna(s['lowest']) else "—")
+        m1.metric("Occurrences", f"{s.get('count', 0):,}")
+        m2.metric("Win Rate", _safe_pct(s.get('win_rate')))
+        m3.metric("Total $", _safe_money(s.get('total_profit')))
+        m4.metric("ROI", _safe_pct(s.get('roi')))
+        m5.metric("Lowest Pt", _safe_money(s.get('lowest')))
 
-        # Games table
-        st.markdown(f"**{len(chosen['games'])} matched games**")
-        st.dataframe(format_games_table(chosen['games']), use_container_width=True, height=400, hide_index=True)
+        # If the favorite has a structured pattern, we can rebuild the games table
+        # and chart on demand using the currently-loaded CSV.
+        rebuilt_mask = None
+        if 'games' not in chosen or chosen.get('games') is None:
+            rebuilt_mask = reconstruct_fav_mask(chosen, pairs, stat_names)
 
-        # Cumulative chart
-        st.markdown("**Cumulative profit over time**")
-        cum_data = chosen['games'].copy()
-        cum_data['date'] = pd.to_datetime(cum_data['date'])
-        cum_data = cum_data.sort_values('date')
-        # Recompute cumulative in case 'cumulative' col got reformatted as text
-        if cum_data['profit'].dtype == 'object':
-            cum_data['profit'] = cum_data['profit'].astype(str).str.replace('[$,]', '', regex=True).astype(float)
-        cum_data['cumulative'] = cum_data['profit'].cumsum()
-        st.line_chart(cum_data.set_index('date')['cumulative'])
+        # Show the games table
+        games_to_show = chosen.get('games')
+        if (games_to_show is None or len(games_to_show) == 0) and rebuilt_mask is not None:
+            # Reconstruct from current CSV
+            rebuilt = pairs[rebuilt_mask].sort_values('date').reset_index(drop=True).copy()
+            rebuilt['cumulative'] = rebuilt['profit'].cumsum().round(2)
+            games_to_show = rebuilt[['date', 'team', 'home_team', 'result', 'risk', 'profit', 'cumulative', 'odds']]
 
-        # Monthly
-        st.markdown("**Monthly breakdown**")
-        st.dataframe(format_monthly_table(chosen['monthly']), use_container_width=True, hide_index=True)
+        if games_to_show is not None and len(games_to_show) > 0:
+            st.markdown(f"**{len(games_to_show)} matched games**")
+            st.dataframe(format_games_table(games_to_show), use_container_width=True, height=400, hide_index=True)
 
-        # Export favorites
+            # Cumulative chart — robust to formatted or numeric input
+            st.markdown("**Cumulative profit over time**")
+            cum_data = games_to_show.copy()
+            try:
+                cum_data['date'] = pd.to_datetime(cum_data['date'])
+                cum_data = cum_data.sort_values('date')
+                if cum_data['profit'].dtype == 'object':
+                    cum_data['profit'] = cum_data['profit'].astype(str).str.replace(r'[\$,]', '', regex=True).astype(float)
+                cum_data['cumulative'] = cum_data['profit'].cumsum()
+                st.line_chart(cum_data.set_index('date')['cumulative'])
+            except Exception:
+                st.caption("(Chart unavailable for this favorite)")
+
+            # Monthly
+            monthly = chosen.get('monthly')
+            if (monthly is None or (hasattr(monthly, 'empty') and monthly.empty)) and rebuilt_mask is not None:
+                monthly = monthly_breakdown(pairs, rebuilt_mask)
+            if monthly is not None and not (hasattr(monthly, 'empty') and monthly.empty):
+                st.markdown("**Monthly breakdown**")
+                st.dataframe(format_monthly_table(monthly), use_container_width=True, hide_index=True)
+        else:
+            # Couldn't reconstruct — likely an ML pattern or different CSV
+            st.info(
+                "Detailed games and chart aren't available for this favorite "
+                "(this happens for ML-model patterns, or if the favorite was saved with "
+                "a different CSV than the one currently loaded). The summary stats above are still accurate."
+            )
+
+        # Export summary CSV
         st.markdown("---")
-        st.markdown("### 📥 Export favorites")
-        st.caption("Download all your favorites as a single CSV. The patterns and stats are preserved; "
-                   "you can re-import context by re-running the same equation in Tab 1.")
+        st.markdown("### 📥 Export favorites summary")
+        st.caption("CSV summary of all favorites — useful for tracking elsewhere.")
         export_rows = []
         for i, f in enumerate(favs):
+            st_ = f.get('stats', {}) or {}
             export_rows.append({
-                'fav_idx': i, 'saved_at': f['saved_at'], 'pattern': f['eq'],
-                'count': f['stats']['count'], 'wins': f['stats']['wins'], 'losses': f['stats']['losses'],
-                'win_rate': f['stats']['win_rate'], 'total_profit': f['stats']['total_profit'],
-                'roi': f['stats']['roi'], 'lowest_point': f['stats']['lowest'],
+                'fav_idx': i,
+                'saved_at': f.get('saved_at', ''),
+                'pattern': f.get('eq', ''),
+                'count': st_.get('count'),
+                'wins': st_.get('wins'),
+                'losses': st_.get('losses'),
+                'win_rate': st_.get('win_rate'),
+                'total_profit': st_.get('total_profit'),
+                'roi': st_.get('roi'),
+                'lowest_point': st_.get('lowest'),
             })
         export_df = pd.DataFrame(export_rows)
-        st.download_button("📥 Download all favorites (summary CSV)",
-                            export_df.to_csv(index=False), "favorites_summary.csv", "text/csv")
+        st.download_button("📥 Download summary CSV",
+                            export_df.to_csv(index=False),
+                            "favorites_summary.csv", "text/csv")
