@@ -134,29 +134,86 @@ def load_data(file_bytes):
     pairs['month'] = df['_month']
     pairs['valid'] = mask
 
-    # Pull stats from the PREVIOUS row — build all at once via concat to avoid fragmentation
-    # Use full feature names (no truncation) and dedupe to guarantee uniqueness
+    # Pull stats from the PREVIOUS row — and compute team-year cumulative avg + ratio.
+    # We build THREE versions of each column so the user can switch instantly:
+    #   raw   = previous game's literal value
+    #   avg   = team-year cumulative average of values BEFORE the previous game
+    #           (matches AVERAGEIFS w/ team+year+date<today)
+    #   ratio = (raw value) / (avg as of that row), so 1.0 = at-average,
+    #           2.0 = double team's running season pace
     stat_names = []
-    stat_data = {}
+    raw_data = {}
+    avg_data = {}
+    ratio_data = {}
+
+    # We need team and year on the ORIGINAL df to compute groupby cumulative means,
+    # because the pair-filtering happens later.
+    df_team = df.iloc[:, TEAM_I]
+    df_year = df['_year']
+
     for c in STAT_COLS:
         col_letter = idx_to_letters(c)
         col_name = df.columns[c]
         base_name = f"{col_letter}_{col_name}"
         feature_name = base_name
         suffix = 2
-        while feature_name in stat_data:
+        while feature_name in raw_data:
             feature_name = f"{base_name}_{suffix}"
             suffix += 1
-        stat_data[feature_name] = df.iloc[:, c].shift(1)
+
+        raw_series = df.iloc[:, c]
+
+        # Cumulative team-year average up to but NOT including current row.
+        # Using .transform() instead of .apply() avoids index shuffling and is faster.
+        cum_avg = raw_series.groupby([df_team, df_year]).transform(
+            lambda s: s.expanding().mean().shift(1)
+        )
+
+        # Ratio = today's value / running average. NaN if avg is 0 or missing.
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ratio = raw_series / cum_avg.replace(0, np.nan)
+
+        # Now shift each by 1 to get the PREVIOUS row's value (matches the pair logic)
+        raw_data[feature_name]   = raw_series.shift(1)
+        avg_data[feature_name]   = cum_avg.shift(1)
+        ratio_data[feature_name] = ratio.shift(1)
+
         stat_names.append(feature_name)
-    stat_df = pd.DataFrame(stat_data, index=df.index)
-    pairs = pd.concat([pairs, stat_df], axis=1)
 
-    # Filter to valid pairs only
-    pairs = pairs[pairs['valid']].drop(columns='valid').reset_index(drop=True)
-    pairs = pairs[pairs['result'].isin(['W', 'L'])].reset_index(drop=True)
+    raw_df   = pd.DataFrame(raw_data,   index=df.index)
+    avg_df   = pd.DataFrame(avg_data,   index=df.index)
+    ratio_df = pd.DataFrame(ratio_data, index=df.index)
 
-    return pairs, stat_names, n_corrected
+    # Build three full pair DataFrames — one per mode
+    pairs_raw   = pd.concat([pairs, raw_df],   axis=1)
+    pairs_avg   = pd.concat([pairs, avg_df],   axis=1)
+    pairs_ratio = pd.concat([pairs, ratio_df], axis=1)
+
+    # Filter each to valid pairs and drop pre-result rows
+    def _finalize(p):
+        p = p[p['valid']].drop(columns='valid').reset_index(drop=True)
+        p = p[p['result'].isin(['W', 'L'])].reset_index(drop=True)
+        return p
+
+    pairs_by_mode = {
+        'raw':   _finalize(pairs_raw),
+        'avg':   _finalize(pairs_avg),
+        'ratio': _finalize(pairs_ratio),
+    }
+
+    # Date-order check: each (team, year) group must be chronologically sorted
+    # for the cumulative averages to be valid. If not, surface as a flag.
+    n_unsorted_groups = 0
+    try:
+        order_check = (
+            df.groupby([df_team, df_year])['_date']
+              .apply(lambda s: s.is_monotonic_increasing)
+        )
+        n_unsorted_groups = int((~order_check).sum())
+    except Exception:
+        n_unsorted_groups = 0
+
+    return pairs_by_mode, stat_names, n_corrected, n_unsorted_groups
 
 
 def evaluate_mask(pairs, mask):
@@ -220,6 +277,57 @@ def monthly_breakdown(pairs, mask):
     return out
 
 
+def yearly_breakdown(pairs, mask):
+    """Year-by-year breakdown — critical for spotting overfit patterns.
+    A pattern that profits in all years is real signal; a pattern that profits
+    in only one year is likely a coincidence."""
+    matches = pairs[mask].copy()
+    if len(matches) == 0:
+        return pd.DataFrame()
+    rows = []
+    for yr in sorted(matches['year'].dropna().unique()):
+        sub = matches[matches['year'] == yr]
+        if len(sub) == 0:
+            continue
+        wins = (sub['result'] == 'W').sum()
+        losses = (sub['result'] == 'L').sum()
+        risk = sub['risk'].sum()
+        w_profit = sub.loc[sub['result'] == 'W', 'profit'].sum()
+        l_profit = sub.loc[sub['result'] == 'L', 'profit'].sum()
+        total = sub['profit'].sum()
+        wr = (wins / (wins + losses)) if (wins + losses) > 0 else np.nan
+        roi = (total / risk) if risk > 0 else np.nan
+        rows.append({
+            'Year': int(yr), 'Wins': int(wins), 'Losses': int(losses),
+            'Win Rate': wr, 'Risk': round(risk, 2),
+            'W $': round(w_profit, 2), 'L $': round(l_profit, 2),
+            'Total $': round(total, 2), 'ROI': roi,
+        })
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    total_risk = out['Risk'].sum()
+    total_profit = out['Total $'].sum()
+    total_wins = out['Wins'].sum()
+    total_losses = out['Losses'].sum()
+    total_wr = (total_wins / (total_wins + total_losses)) if (total_wins + total_losses) > 0 else np.nan
+    total_roi = (total_profit / total_risk) if total_risk > 0 else np.nan
+    total_row = {
+        'Year': 'TOTAL', 'Wins': total_wins, 'Losses': total_losses,
+        'Win Rate': total_wr, 'Risk': round(total_risk, 2),
+        'W $': round(out['W $'].sum(), 2), 'L $': round(out['L $'].sum(), 2),
+        'Total $': round(total_profit, 2), 'ROI': total_roi,
+    }
+    out = pd.concat([out, pd.DataFrame([total_row])], ignore_index=True)
+
+    # Add a "consistency" indicator on the total row — was the pattern profitable in every individual year?
+    individual_years = out[out['Year'] != 'TOTAL']
+    profitable_years = (individual_years['Total $'] > 0).sum()
+    total_years = len(individual_years)
+    out.attrs['consistency'] = f"{profitable_years} of {total_years} years profitable"
+    return out
+
+
 def _fmt_money(x):
     """Format as $1,234.56 or -$1,234.56 (sign before $)."""
     if pd.isna(x):
@@ -247,6 +355,37 @@ def format_monthly_table(df):
     return formatted.style.apply(bold_total, axis=1)
 
 
+def format_yearly_table(df):
+    """Apply $/% formatting and bold-the-TOTAL-row styling for yearly breakdown."""
+    if df is None or df.empty:
+        return df
+    formatted = df.copy()
+    formatted['Risk'] = formatted['Risk'].apply(_fmt_money)
+    formatted['W $'] = formatted['W $'].apply(_fmt_money)
+    formatted['L $'] = formatted['L $'].apply(_fmt_money)
+    formatted['Total $'] = formatted['Total $'].apply(_fmt_money)
+    formatted['Win Rate'] = formatted['Win Rate'].apply(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
+    formatted['ROI'] = formatted['ROI'].apply(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
+
+    def style_row(row):
+        is_total = row['Year'] == 'TOTAL'
+        # Green tint for profitable individual years, red tint for losing years
+        if is_total:
+            return ['font-weight: bold; background-color: rgba(255, 215, 0, 0.15)' for _ in row]
+        try:
+            total_str = str(row['Total $']).replace('$', '').replace(',', '').replace('—', '0')
+            total_val = float(total_str)
+            if total_val > 0:
+                return ['background-color: rgba(0, 200, 0, 0.08)' for _ in row]
+            elif total_val < 0:
+                return ['background-color: rgba(200, 0, 0, 0.08)' for _ in row]
+        except Exception:
+            pass
+        return ['' for _ in row]
+
+    return formatted.style.apply(style_row, axis=1)
+
+
 def format_games_table(games_df):
     """Apply $ and date formatting for the matched-games table on Tab 4."""
     if games_df is None or len(games_df) == 0:
@@ -272,6 +411,24 @@ with st.sidebar:
     if uploaded:
         st.success("File ready. Tabs activated.")
 
+    st.divider()
+    st.header("📊 Stat Mode")
+    mode_label = st.radio(
+        "How should the app interpret each stat column?",
+        options=["Raw", "Avg", "Ratio"],
+        index=0,
+        key="mode_selector",
+        help=(
+            "**Raw** = previous game's literal value (e.g., 8 runs).\n\n"
+            "**Avg** = team's cumulative season average BEFORE the previous game "
+            "(matches your AVERAGEIFS formula).\n\n"
+            "**Ratio** = previous game's value ÷ running team-season average. "
+            "1.0 = at average, 2.0 = double team's typical pace. "
+            "Use this mode when combining multiple columns of different scales."
+        ),
+    )
+    mode_key = mode_label.lower()  # 'raw', 'avg', or 'ratio'
+
 if uploaded is None:
     st.info("👈 Upload your CSV to begin. The app expects the column layout from your sheet (A=date, B=team, H=home_team, J=W/L, I:CL=stats, CU=date string, CZ=odds, DJ=risk, DL=profit).")
     st.stop()
@@ -279,10 +436,30 @@ if uploaded is None:
 # Load
 with st.spinner("Loading and pairing rows..."):
     try:
-        pairs, stat_names, n_corrected = load_data(uploaded.getvalue())
+        pairs_by_mode, stat_names, n_corrected, n_unsorted_groups = load_data(uploaded.getvalue())
     except Exception as e:
         st.error(f"Failed to load: {e}")
         st.stop()
+
+# Date-order warning — Avg/Ratio mode require chronological order within each team-year
+if n_unsorted_groups > 0:
+    st.error(
+        f"⛔ **Date order issue:** {n_unsorted_groups} team-year group(s) are not sorted by date. "
+        f"This means **Avg and Ratio modes will produce incorrect results** for these teams. "
+        f"To fix: sort your CSV by Team, then by Date (ascending) within each team. "
+        f"Raw mode is unaffected and safe to use."
+    )
+
+# Pick the active dataset based on the user's mode selection
+pairs = pairs_by_mode[mode_key]
+
+# Display the current mode prominently so the user knows what they're seeing
+mode_descriptions = {
+    'raw':   "🔢 **Raw mode** — using previous game's literal stat values.",
+    'avg':   "📈 **Avg mode** — using team's cumulative season average up to the previous game.",
+    'ratio': "⚖️ **Ratio mode** — using (prev value) ÷ (running team-season average). 1.0 = at average.",
+}
+st.info(mode_descriptions[mode_key])
 
 # Diagnostic warning if the CSV has any sign inconsistencies (should be 0 on clean data)
 if n_corrected > 0:
@@ -370,21 +547,26 @@ if 'favorites' not in st.session_state:
     st.session_state['favorites'] = load_favorites_from_disk()
 
 
-def reconstruct_fav_mask(fav, pairs, stat_names):
+def reconstruct_fav_mask(fav, pairs_by_mode_dict, stat_names):
     """Given a saved favorite's 'structured' pattern, rebuild the boolean mask.
-    Returns None if pattern can't be rebuilt (e.g., ML model patterns)."""
+    Uses the saved mode's pairs DataFrame (so a Ratio-mode favorite is reconstructed
+    against the Ratio pairs, not whatever the user has currently selected).
+    Returns (mask, mode_used) or (None, None) if pattern can't be rebuilt."""
     s = fav.get('structured')
     if not s:
-        return None
+        return None, None
+    saved_mode = s.get('mode', 'raw')  # default to raw for backwards compat
+    if saved_mode not in pairs_by_mode_dict:
+        return None, None
+    pairs_local = pairs_by_mode_dict[saved_mode]
     ptype = s.get('type')
     try:
         if ptype == 'manual':
-            # {col_keys: [[col, mult], ...], operator, thresh OR [lo, hi]}
-            score = np.zeros(len(pairs))
+            score = np.zeros(len(pairs_local))
             for col, m in s['col_keys']:
-                if col not in pairs.columns:
-                    return None
-                score = score + pairs[col].fillna(0) * float(m)
+                if col not in pairs_local.columns:
+                    return None, None
+                score = score + pairs_local[col].fillna(0) * float(m)
             op = s['operator']
             t = s['thresh']
             if op == ">":   mask = score > t
@@ -395,21 +577,20 @@ def reconstruct_fav_mask(fav, pairs, stat_names):
                 lo, hi = t
                 mask = (score >= lo) & (score <= hi)
             else:
-                return None
-            return pd.Series(mask, index=pairs.index).fillna(False)
+                return None, None
+            return pd.Series(mask, index=pairs_local.index).fillna(False), saved_mode
 
         elif ptype == 'threshold_combo':
-            # {combo: [[col, op, thresh], ...]}
-            mask = pd.Series(True, index=pairs.index)
+            mask = pd.Series(True, index=pairs_local.index)
             for col, op, t in s['combo']:
-                if col not in pairs.columns:
-                    return None
-                v = pairs[col]
+                if col not in pairs_local.columns:
+                    return None, None
+                v = pairs_local[col]
                 mask &= (v > t) if op == ">" else (v < t)
-            return mask.fillna(False)
+            return mask.fillna(False), saved_mode
     except Exception:
-        return None
-    return None
+        return None, None
+    return None, None
 
 # ============================================================
 # TAB 1: Single pattern with multipliers
@@ -469,16 +650,16 @@ with tab1:
     run_clicked = btn_col1.button("Run backtest", type="primary", key="t1_run")
     clear_clicked = btn_col2.button("🗑️ Clear results", key="t1_clear")
 
-    # Build a "fingerprint" of the current inputs to detect changes
+    # Build a "fingerprint" of the current inputs to detect changes — include mode
     if operator == "between":
-        current_fingerprint = (n_cols, tuple(col_keys), operator, thresh_lo, thresh_hi)
+        current_fingerprint = (mode_key, n_cols, tuple(col_keys), operator, thresh_lo, thresh_hi)
     else:
-        current_fingerprint = (n_cols, tuple(col_keys), operator, thresh)
+        current_fingerprint = (mode_key, n_cols, tuple(col_keys), operator, thresh)
 
     if clear_clicked:
-        for k in ['t1_stats', 't1_mask', 't1_eq', 't1_monthly', 't1_fingerprint',
+        for k in ['t1_stats', 't1_mask', 't1_eq', 't1_monthly', 't1_yearly', 't1_fingerprint',
                   't1_col_keys', 't1_operator', 't1_thresh',
-                  'last_mask', 'last_eq', 'last_structured']:
+                  'last_mask', 'last_eq', 'last_mode', 'last_structured']:
             st.session_state.pop(k, None)
         st.rerun()
 
@@ -507,6 +688,7 @@ with tab1:
         st.session_state['t1_mask'] = mask
         st.session_state['t1_eq'] = eq_str
         st.session_state['t1_monthly'] = monthly_breakdown(pairs, mask)
+        st.session_state['t1_yearly'] = yearly_breakdown(pairs, mask)
         st.session_state['t1_fingerprint'] = current_fingerprint
         st.session_state['t1_col_keys'] = list(col_keys)
         st.session_state['t1_operator'] = operator
@@ -514,9 +696,11 @@ with tab1:
 
         # Also save for Tab 4
         st.session_state['last_mask'] = mask
-        st.session_state['last_eq'] = eq_str
+        st.session_state['last_eq'] = f"[{mode_label}] " + eq_str
+        st.session_state['last_mode'] = mode_key
         st.session_state['last_structured'] = {
             'type': 'manual',
+            'mode': mode_key,
             'col_keys': [[c, float(m)] for c, m in col_keys],
             'operator': operator,
             'thresh': [thresh_lo, thresh_hi] if operator == "between" else float(thresh),
@@ -544,6 +728,15 @@ with tab1:
             st.markdown("**Monthly breakdown**")
             monthly = st.session_state['t1_monthly']
             st.dataframe(format_monthly_table(monthly), use_container_width=True, hide_index=True)
+
+            # Yearly breakdown — overfit detector
+            yearly = st.session_state.get('t1_yearly')
+            if yearly is not None and not yearly.empty:
+                st.markdown("**Yearly breakdown** — does this work in every season?")
+                consistency = yearly.attrs.get('consistency', '')
+                if consistency:
+                    st.caption(f"📅 {consistency}")
+                st.dataframe(format_yearly_table(yearly), use_container_width=True, hide_index=True)
 
             st.info("👉 Switch to 'Inspect Games' to see the actual matched games.")
 
@@ -588,12 +781,27 @@ with tab2:
     min_profit = f3.number_input("Min total $", value=0.0, step=100.0, key="t2_mp")
     min_wins = f4.number_input("Min wins", value=0, min_value=0, key="t2_mw2")
 
+    f5, f6 = st.columns(2)
+    min_roi = f5.number_input(
+        "Min ROI (e.g. 0.10 = 10%)",
+        value=0.0, min_value=-1.0, max_value=10.0, step=0.05, format="%.4f",
+        key="t2_mr",
+        help="Filters out patterns whose ROI is below this. ROI = total_profit ÷ total_risk."
+    )
+    min_lowest = f6.number_input(
+        "Min lowest point ($) — drawdown floor",
+        value=-1_000_000.0, step=100.0,
+        key="t2_ml",
+        help="Filters out patterns whose worst cumulative profit dipped below this. "
+             "Use a value like -500 to require the pattern never went deeper than -$500."
+    )
+
     btn_col1, btn_col2 = st.columns([1, 1])
     run_search = btn_col1.button("Run search", type="primary", key="t2_run")
     clear_t2 = btn_col2.button("🗑️ Clear results", key="t2_clear")
 
     if clear_t2:
-        for k in ['leaderboard', 'last_mask', 'last_eq', 'last_structured']:
+        for k in ['leaderboard', 'last_mask', 'last_eq', 'last_mode', 'last_structured']:
             st.session_state.pop(k, None)
         st.rerun()
 
@@ -659,6 +867,8 @@ with tab2:
             if stats['wins'] < min_wins: continue
             if pd.notna(stats['win_rate']) and stats['win_rate'] < min_wr: continue
             if stats['total_profit'] < min_profit: continue
+            if pd.notna(stats['roi']) and stats['roi'] < min_roi: continue
+            if pd.notna(stats['lowest']) and stats['lowest'] < min_lowest: continue
 
             desc = " AND ".join([f"{c}{op}{t}" for c, op, t in combo])
             results.append({'pattern': desc, **stats, '_combo': combo})
@@ -699,9 +909,11 @@ with tab2:
                 mask &= (v > t) if op == ">" else (v < t)
             mask = mask.fillna(False)
             st.session_state['last_mask'] = mask
-            st.session_state['last_eq'] = lb.iloc[idx]['pattern']
+            st.session_state['last_eq'] = f"[{mode_label}] " + lb.iloc[idx]['pattern']
+            st.session_state['last_mode'] = mode_key
             st.session_state['last_structured'] = {
                 'type': 'threshold_combo',
+                'mode': mode_key,
                 'combo': [[col, op, float(t)] for col, op, t in combo],
             }
             st.success("Loaded. Switch to Inspect Games tab.")
@@ -725,7 +937,7 @@ with tab3:
     clear_t3 = btn_col2.button("🗑️ Clear results", key="t3_clear")
 
     if clear_t3:
-        for k in ['last_mask', 'last_eq', 'last_structured']:
+        for k in ['last_mask', 'last_eq', 'last_mode', 'last_structured']:
             st.session_state.pop(k, None)
         st.rerun()
 
@@ -840,9 +1052,19 @@ with tab3:
             test_monthly = monthly_breakdown(pairs, test_mask_full)
             st.dataframe(format_monthly_table(test_monthly), use_container_width=True, hide_index=True)
 
+            # Yearly breakdown — extra-important for ML, since overfitting is the main risk
+            test_yearly = yearly_breakdown(pairs, test_mask_full)
+            if not test_yearly.empty:
+                st.markdown(f"### 📅 Yearly breakdown (test set)")
+                consistency = test_yearly.attrs.get('consistency', '')
+                if consistency:
+                    st.caption(f"📅 {consistency}")
+                st.dataframe(format_yearly_table(test_yearly), use_container_width=True, hide_index=True)
+
             # Save
             st.session_state['last_mask'] = test_mask_full
-            st.session_state['last_eq'] = "ML model: " + eq[:100] + "..."
+            st.session_state['last_eq'] = f"[{mode_label}] ML model: " + eq[:100] + "..."
+            st.session_state['last_mode'] = mode_key
             st.session_state['last_structured'] = None  # ML pattern can't be reconstructed
 
 # ============================================================
@@ -855,8 +1077,22 @@ with tab4:
     else:
         eq_label = st.session_state.get('last_eq', '(no description)')
         st.markdown(f"**Pattern:** `{eq_label}`")
+
+        # Mode mismatch warning: pattern was created in mode X, sidebar shows mode Y
+        last_mode = st.session_state.get('last_mode')
+        if last_mode is not None and last_mode != mode_key:
+            st.warning(
+                f"⚠️ This pattern was run in **{last_mode.title()}** mode, but your sidebar "
+                f"is currently set to **{mode_label}**. The matched games and stats below were "
+                f"computed against {last_mode.title()}-mode data. Switch the sidebar back to "
+                f"**{last_mode.title()}** if you want consistency, or re-run the pattern in "
+                f"{mode_label} mode to use the new mode."
+            )
+
+        # Use the pattern's original mode for displayed data (so stats stay consistent)
+        active_pairs = pairs_by_mode[last_mode] if last_mode in pairs_by_mode else pairs
         mask = st.session_state['last_mask']
-        games = pairs[mask].sort_values('date').reset_index(drop=True).copy()
+        games = active_pairs[mask].sort_values('date').reset_index(drop=True).copy()
 
         if len(games) == 0:
             st.warning("No matched games.")
@@ -871,13 +1107,13 @@ with tab4:
             clear_t4 = ac2.button("🗑️ Clear inspection", key="t4_clear")
 
             if clear_t4:
-                for k in ['last_mask', 'last_eq', 'last_structured']:
+                for k in ['last_mask', 'last_eq', 'last_mode', 'last_structured']:
                     st.session_state.pop(k, None)
                 st.rerun()
 
             if save_clicked:
-                # Capture summary stats
-                stats = evaluate_mask(pairs, mask)
+                # Capture summary stats — use the pattern's original mode pairs
+                stats = evaluate_mask(active_pairs, mask)
 
                 # Capture structured pattern (for re-loading later w/o needing the model)
                 structured = st.session_state.get('last_structured', None)
@@ -888,7 +1124,7 @@ with tab4:
                     'mask': mask.copy(),
                     'stats': stats,
                     'games': games[display_cols].copy(),
-                    'monthly': monthly_breakdown(pairs, mask),
+                    'monthly': monthly_breakdown(active_pairs, mask),
                     'saved_at': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M'),
                     'structured': structured,
                 }
@@ -906,8 +1142,13 @@ with tab4:
 
             # Formatted monthly breakdown
             st.markdown("**Monthly breakdown**")
-            monthly = monthly_breakdown(pairs, mask)
+            monthly = monthly_breakdown(active_pairs, mask)
             st.dataframe(format_monthly_table(monthly), use_container_width=True, hide_index=True)
+
+            # Yearly breakdown — critical for spotting overfit patterns
+            st.markdown("**Yearly breakdown** — does this pattern work consistently across seasons?")
+            yearly = yearly_breakdown(active_pairs, mask)
+            st.dataframe(format_yearly_table(yearly), use_container_width=True, hide_index=True)
 
             # CSV download (raw, unformatted — better for reuse in Excel etc.)
             st.download_button("📥 Download matched games CSV",
@@ -1038,16 +1279,27 @@ with tab5:
         m5.metric("Lowest Pt", _safe_money(s.get('lowest')))
 
         # If the favorite has a structured pattern, we can rebuild the games table
-        # and chart on demand using the currently-loaded CSV.
+        # and chart on demand. Use the SAVED MODE's pairs DataFrame, not the user's
+        # current selection — the favorite's stats were computed against that mode.
         rebuilt_mask = None
+        rebuilt_mode = None
+        rebuilt_pairs = None
         if 'games' not in chosen or chosen.get('games') is None:
-            rebuilt_mask = reconstruct_fav_mask(chosen, pairs, stat_names)
+            rebuilt_mask, rebuilt_mode = reconstruct_fav_mask(chosen, pairs_by_mode, stat_names)
+            if rebuilt_mode is not None:
+                rebuilt_pairs = pairs_by_mode[rebuilt_mode]
+                if rebuilt_mode != mode_key:
+                    st.caption(
+                        f"ℹ️ This favorite was saved in **{rebuilt_mode.title()}** mode. "
+                        f"Reconstructed games shown below use that mode (your current sidebar mode "
+                        f"is **{mode_label}**)."
+                    )
 
         # Show the games table
         games_to_show = chosen.get('games')
         if (games_to_show is None or len(games_to_show) == 0) and rebuilt_mask is not None:
-            # Reconstruct from current CSV
-            rebuilt = pairs[rebuilt_mask].sort_values('date').reset_index(drop=True).copy()
+            # Reconstruct from the appropriate pairs DataFrame
+            rebuilt = rebuilt_pairs[rebuilt_mask].sort_values('date').reset_index(drop=True).copy()
             rebuilt['cumulative'] = rebuilt['profit'].cumsum().round(2)
             games_to_show = rebuilt[['date', 'team', 'home_team', 'result', 'risk', 'profit', 'cumulative', 'odds']]
 
@@ -1071,10 +1323,20 @@ with tab5:
             # Monthly
             monthly = chosen.get('monthly')
             if (monthly is None or (hasattr(monthly, 'empty') and monthly.empty)) and rebuilt_mask is not None:
-                monthly = monthly_breakdown(pairs, rebuilt_mask)
+                monthly = monthly_breakdown(rebuilt_pairs, rebuilt_mask)
             if monthly is not None and not (hasattr(monthly, 'empty') and monthly.empty):
                 st.markdown("**Monthly breakdown**")
                 st.dataframe(format_monthly_table(monthly), use_container_width=True, hide_index=True)
+
+            # Yearly
+            if rebuilt_mask is not None:
+                yearly = yearly_breakdown(rebuilt_pairs, rebuilt_mask)
+                if not yearly.empty:
+                    st.markdown("**Yearly breakdown** — does this work in every season?")
+                    consistency = yearly.attrs.get('consistency', '')
+                    if consistency:
+                        st.caption(f"📅 {consistency}")
+                    st.dataframe(format_yearly_table(yearly), use_container_width=True, hide_index=True)
         else:
             # Couldn't reconstruct — likely an ML pattern or different CSV
             st.info(
