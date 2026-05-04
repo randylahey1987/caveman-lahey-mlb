@@ -1,5 +1,5 @@
 """
-MLB Pattern Search & Auto-Multiplier App
+MLB Pattern Search & Auto-Multiplier App 
 Run locally: streamlit run app.py
 Deploy: push to GitHub, connect to share.streamlit.io
 """
