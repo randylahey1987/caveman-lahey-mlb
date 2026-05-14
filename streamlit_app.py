@@ -713,17 +713,21 @@ with st.sidebar:
     rl_prior_filter    = st.selectbox("Prior Runline result",     prior_options(prior_scope, ['W', 'L']),       key="prior_rl")
 
 if uploaded is None:
-    st.info(
-        "👈 Upload your CSV to begin.\n\n"
-        "The app expects the new aggregated layout:\n"
-        "• DG/DH/DI = Moneyline result/risk/profit\n"
-        "• DL/DM/DN = Totals\n"
-        "• DP/DQ/DR = Runline\n\n"
-        "Predictors come from columns I:CL plus:\n"
-        "• CZ = open ML\n"
-        "• DA = open total line\n"
-        "• DC = closing runline"
-    )
+    st.info("""
+👈 Upload your CSV to begin.
+
+The app expects the new aggregated layout:
+
+• DG/DH/DI = Moneyline result/risk/profit  
+• DL/DM/DN = Totals  
+• DP/DQ/DR = Runline
+
+Predictors come from columns I:CL plus:
+
+• CZ = open ML  
+• DA = open total line  
+• DC = closing runline
+""")
     st.stop()
 
 # Load
