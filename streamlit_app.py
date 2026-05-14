@@ -647,6 +647,138 @@ def cumulative_profit_chart(dates, cumulative_values):
 
 
 # ============================================================
+# HOME / REFERENCE CONTENT
+# ============================================================
+# Single source of truth for the reference text — shown both on the pre-upload
+# screen and in the always-accessible Home tab.
+HOME_CONTENT = """
+## 👋 Welcome to the MLB Pattern Search & Auto-Multiplier
+
+This app mines historical MLB data to find betting patterns across **three markets** —
+Moneyline, Totals (Over/Under), and Runline.
+
+---
+
+### 📂 Expected CSV layout
+
+The app expects the **aggregated column layout**. Key columns:
+
+| Columns | Market | What they hold |
+|---|---|---|
+| **DG / DH / DI** | Moneyline | result (W/L) · risk · profit |
+| **DL / DM / DN** | Totals | result (O/U/P) · risk · profit |
+| **DP / DQ / DR** | Runline | result (W/L) · risk · profit |
+
+**Predictor columns** come from **I:CL**, plus three Vegas-info columns:
+
+| Column | Meaning |
+|---|---|
+| **CZ** | Opening Moneyline odds |
+| **DA** | Opening total line |
+| **DC** | Closing runline |
+
+Dates are read from **CU** (with **A** as a fallback). Excel-serial date numbers are auto-converted.
+
+---
+
+### 🎯 Bet Type — which market to analyze
+
+| Market | Predicts | Uses |
+|---|---|---|
+| **Moneyline** | W / L | DH risk + DI profit |
+| **Totals** | O / U / P | DM risk + DN profit — pushes tracked separately, never counted as a loss |
+| **Runline** | W / L | DQ risk + DR profit |
+
+**Totals target outcome (O or U):** when you pick **O**, the app tests Over patterns using profit as-is.
+When you pick **U**, profits are flipped so Unders become the winning side. Pushes always settle at $0.
+
+---
+
+### 📊 Stat Mode — how each stat column is interpreted
+
+| Mode | Meaning |
+|---|---|
+| **Raw** | The previous game's literal stat value |
+| **Avg** | The team's cumulative season average **through** the previous game (matches an AVERAGEIFS formula) |
+| **Ratio** | Previous game's value ÷ running team-season average. **1.0 = exactly at the team's average**, 2.0 = double their typical pace |
+
+Use **Ratio** when combining columns that live on very different scales (e.g. pitch counts vs. run totals) —
+it normalizes everything around 1.0 so multipliers and thresholds behave consistently.
+
+---
+
+### 🔎 Prior Result Filters
+
+Narrow any search to games where the team's **previous game(s)** had a specific bet outcome.
+
+| Setting | Meaning |
+|---|---|
+| **Prior rows to check = 1** | Only the immediately previous game |
+| **Prior rows to check = 2** | Two games back **and** the previous game, in order — unlocks sequences like `OO`, `WL`, `LW` |
+| **Prior Moneyline / Total / Runline result** | Filter on that market's prior outcome. `None` = no filter |
+
+For 2-row sequences, the app only counts rows where both prior games belong to the **same team and season** —
+so a sequence never accidentally mixes two different teams.
+
+---
+
+### 🗂️ The Tabs
+
+| Tab | What it does |
+|---|---|
+| **🏠 Home** | This reference page — always accessible |
+| **🎯 Test One Pattern** | Build a custom equation: pick columns, multipliers, an operator, and a threshold. Backtest the games that match |
+| **🔍 Threshold Brute-Force** | Tests thousands of column + threshold combinations automatically, ranked by profit / ROI / consistency |
+| **🧠 Auto-Multiplier** | Machine learning (L1-regularized logistic regression) finds the optimal column weights to predict your target |
+| **📋 Inspect Games** | Drill into the actual games a pattern matched — full table, cumulative profit chart, monthly + yearly breakdowns |
+| **⭐ Saved Favorites** | Persistent storage for patterns worth keeping. Backup / restore as JSON |
+
+---
+
+### 🔍 Threshold Brute-Force — control reference
+
+| Control | What it does |
+|---|---|
+| **Columns per combination** | How many conditions per pattern (2 or 3) |
+| **Pre-filter to top N** | Ranks columns by single-column predictive edge first, then only combines from the top N. Big speedup |
+| **Threshold values per column** | How many evenly-spaced quantile thresholds to test per column. More = finer search, slower |
+| **Operators** | `>` and/or `<`. Selecting both tests every operator mix per combination |
+| **Exclude columns** | Columns picked here never appear in any tested pattern |
+| **Force-include** | Locks one exact rule (column + operator + threshold) into **every** tested pattern. The search then finds the best partners for it |
+| **Min ROI** | ROI = total profit ÷ total risk |
+| **Min lowest point** | Drawdown floor — filters out patterns whose worst cumulative dip went below this |
+
+The leaderboard includes **yearly consistency columns** (`Yrs Prof`, `worst_year`, `best_year`).
+A pattern that profits in **4 of 4 seasons** is far more trustworthy than one that made everything in a single year —
+sort by `yrs_profitable` to surface the consistent ones.
+
+---
+
+### 🧠 Auto-Multiplier — control reference
+
+| Control | What it does |
+|---|---|
+| **Train on data BEFORE this year** | Splits data into train (older) and test (this year onward). Test performance is the real-world signal |
+| **Top features to keep** | L1 regularization zeros out unimportant columns — this sets how many survive |
+| **Bet when predicted P(target) ≥** | The probability cutoff above which the model "places a bet" |
+
+---
+
+### ⚠️ Data-quality notes
+
+- **Risk columns** are always treated as positive dollar amounts.
+- **Profit columns** are signed — positive on wins, negative on losses.
+- If a profit column's sign disagrees with its result column, the app surfaces a warning so you can check the source CSV.
+- **Avg / Ratio modes** require each team's rows to be in chronological order within a season. If they're not, the app warns you — re-export sorted by Team, then Date ascending.
+"""
+
+
+def render_home():
+    """Render the shared reference content (used pre-upload and in the Home tab)."""
+    st.markdown(HOME_CONTENT)
+
+
+# ============================================================
 # UI
 # ============================================================
 st.title("⚾ MLB Pattern Search & Auto-Multiplier")
@@ -713,21 +845,8 @@ with st.sidebar:
     rl_prior_filter    = st.selectbox("Prior Runline result",     prior_options(prior_scope, ['W', 'L']),       key="prior_rl")
 
 if uploaded is None:
-    st.info("""
-👈 Upload your CSV to begin.
-
-The app expects the new aggregated layout:
-
-• DG/DH/DI = Moneyline result/risk/profit  
-• DL/DM/DN = Totals  
-• DP/DQ/DR = Runline
-
-Predictors come from columns I:CL plus:
-
-• CZ = open ML  
-• DA = open total line  
-• DC = closing runline
-""")
+    st.warning("👈 **Upload your CSV in the sidebar to activate the analysis tabs.**")
+    render_home()
     st.stop()
 
 # Load
@@ -800,13 +919,17 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab_home, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🏠 Home",
     "🎯 Test One Pattern",
     "🔍 Threshold Brute-Force",
     "🧠 Auto-Multiplier",
     "📋 Inspect Games",
     "⭐ Saved Favorites",
 ])
+
+with tab_home:
+    render_home()
 
 # ============================================================
 # FAVORITES PERSISTENCE
